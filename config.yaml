@@ -1,0 +1,49 @@
+
+mcp:
+  enabled: true
+  tool_discovery: off
+
+  servers:
+    filesystem:
+      transport: stdio
+      command: cmd
+      args:
+        - /d
+        - /c
+        - npx
+        - -y
+        - "@modelcontextprotocol/server-filesystem"
+        - 'C:\Users\perur\Desktop\workspace'
+      tool_timeout: 60s
+      allowed_tools:
+        - list_allowed_directories
+        - list_directory
+        - directory_tree
+        - search_files
+        - get_file_info
+        - read_text_file
+        - read_multiple_files
+
+    github:
+      transport: http
+      url: https://api.githubcopilot.com/mcp/readonly
+      headers:
+        Authorization: "Bearer ${GITHUB_PAT}"
+        X-MCP-Toolsets: "repos"
+      allowed_tools:
+        - get_file_contents
+      tool_timeout: 60s
+
+    context7:
+      transport: stdio
+      command: cmd
+      args:
+        - /d
+        - /c
+        - npx
+        - -y
+        - "@upstash/context7-mcp@latest"
+      tool_timeout: 60s
+      allowed_tools:
+        - resolve-library-id
+        - query-docs
