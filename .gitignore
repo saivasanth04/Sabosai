@@ -41,6 +41,7 @@ venv.bak/
 *.key
 
 # Output & runtime data
+research_output/
 data/
 Output/
 **/Output/
