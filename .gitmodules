@@ -1,9 +1,6 @@
-[submodule "Agents/specification-agent/.vendor/agent-toolkit"]
-	path = Agents/specification-agent/.vendor/agent-toolkit
-	url = https://github.com/softaworks/agent-toolkit.git
-[submodule "Agents/specification-agent/.vendor/hve-core"]
-	path = Agents/specification-agent/.vendor/hve-core
-	url = https://github.com/microsoft/hve-core.git
-[submodule "Agents/specification-agent/.vendor/pm-skills"]
-	path = Agents/specification-agent/.vendor/pm-skills
-	url = https://github.com/product-on-purpose/pm-skills.git
+[submodule "Agents/Planner Agent/framework/spec-kit"]
+	path = Agents/Planner Agent/framework/spec-kit
+	url = https://github.com/github/spec-kit.git
+[submodule "Agents/Planner Agent/framework/superpowers"]
+	path = Agents/Planner Agent/framework/superpowers
+	url = https://github.com/obra/Superpowers.git

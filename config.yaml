@@ -13,7 +13,7 @@ mcp:
         - npx
         - -y
         - "@modelcontextprotocol/server-filesystem"
-        - 'C:\Users\perur\Desktop\workspace'
+        - 'C:\Projects\NTG'
       tool_timeout: 60s
       allowed_tools:
         - list_allowed_directories
@@ -35,6 +35,8 @@ mcp:
         - search_repositories
         - search_code
         - list_commits
+        - list_branches
+        - list_issues
         - issue_read
       tool_timeout: 60s
 
