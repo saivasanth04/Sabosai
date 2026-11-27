@@ -1,0 +1,61 @@
+# bmad_adapter.toml — settings for the BMAD runtime adapter used by the Planner Agent.
+# Loaded automatically from Agents/Planner_Agent/Runtime_Manager/bmad_adapter.toml
+# (override the path with BMAD_ADAPTER_CONFIG). Environment variables win over this file.
+
+# BMAD-METHOD clone. Leave commented to auto-detect Plugins/BMAD-METHOD-6.12.4/BMAD-METHOD-6.12.4
+# bmad_root = 'C:\Projects\NTG\Agents\Planner_Agent\Plugins\BMAD-METHOD-6.12.4\BMAD-METHOD-6.12.4'
+
+# Project the planner is working on. _bmad/ and _bmad-output/ are created inside it.
+# Default: Agents/Planner_Agent/Workspace. Per-call: BMadRuntime.for_project(path)
+# project_root = 'C:\Projects\NTG\Workspace\my-app'
+
+# Extra folders containing BMAD-style skills (each skill = a folder with SKILL.md)
+extra_skill_roots = []
+
+[gomodel]
+base_url = "http://localhost:8080"     # GoModel gateway (OpenAI-compatible /v1 + MCP at /mcp)
+api_key_env = "GOMODEL_API_KEY"        # env var holding your GoModel key (GOMODEL_MASTER_KEY also read)
+model = "router"                        # your failover virtual model in C:\Projects\NTG\.env (GOMODEL_MODEL overrides)
+# subagent_model = "gpt-4o-mini"        # cheaper model for research/review subagents + summaries
+temperature = 0.3
+max_output_tokens = 8192
+request_timeout_s = 300
+mcp_enabled = true
+mcp_path = "/mcp"                       # "/mcp/<virtual-server>" to hand BMAD a curated tool set
+mcp_servers = []                        # [] = all servers in GoModel config.yaml; or e.g. ["duckduckgo", "crawl4ai", "context7"]
+# mcp_tool_discovery = "search"         # if your catalog grows large: only search_tools + call_tool are listed
+
+[execution]
+max_turns_per_message = 60              # model calls per send() before yielding (resume() continues)
+max_tool_calls_per_turn = 16
+context_token_budget = 110000           # rough budget; older turns are summarised beyond this
+compaction_keep_recent = 14
+tool_result_max_chars = 24000
+subagent_max_turns = 30
+subagent_parallelism = 4
+headless = false                        # default mode for start(); run_skill() defaults to headless
+
+[permissions]
+mode = "auto"                           # auto | ask (approval callback for writes/scripts/MCP) | readonly
+extra_read_roots = []                   # e.g. ['C:\Projects\NTG\docs']
+extra_write_roots = []
+allow_tools = ["*"]                     # fnmatch over tool names (built-in + GoModel MCP)
+deny_tools = []                         # e.g. ["github_*"]
+ask_tools = []                          # always require approval, e.g. ["crawl4ai_*"]
+script_timeout_s = 300
+allow_arbitrary_scripts = false         # only scripts inside the BMAD clone / {project}/_bmad
+protect_bmad_source = true
+allow_commands = true                   # run_command: npm/node/git/pytest… inside the project (no shell chaining)
+allowed_commands = []                   # [] = built-in list: npm npx node pnpm yarn bun git python pytest tsc vite …
+command_timeout_s = 600
+
+[install]                               # answers the BMAD installer would ask
+user_name = "Planner"
+# project_name = "my-app"               # default: project folder name
+communication_language = "English"
+document_output_language = "English"
+output_folder = "_bmad-output"
+user_skill_level = "intermediate"       # beginner | intermediate | expert
+planning_artifacts = "{output_folder}/planning-artifacts"
+implementation_artifacts = "{output_folder}/implementation-artifacts"
+project_knowledge = "docs"
