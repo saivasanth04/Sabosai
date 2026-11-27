@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import _yaml
 from .errors import (BMadLoaderError, BMadResourceLimitError, BMadResourceNotFoundError,
@@ -154,7 +154,8 @@ class BMadLoader:
         )
 
     # --------------------------------------------------------------- resources
-    def read_resource(self, path: str | Path, skill: LoadedBMadSkill | None = None) -> LoadedResource:
+    def read_resource(self, path: str | Path, skill: LoadedBMadSkill | None = None,
+                      reader: "Callable[[Path], str] | None" = None) -> LoadedResource:
         p = Path(str(path))
         if not p.is_absolute():
             if skill is None:
@@ -173,7 +174,7 @@ class BMadLoader:
             raise BMadResourceLimitError(f"{p.name} is {size} B (limit {self.limits.max_file_bytes} B)")
         if p.suffix.lower() not in TEXT_SUFFIXES:
             raise BMadLoaderError(f"not a text resource: {p.name}")
-        content = p.read_text(encoding="utf-8-sig", errors="replace")
+        content = reader(p) if reader else p.read_text(encoding="utf-8-sig", errors="replace")
         if skill is not None and (p.is_relative_to(skill.skill_root) or p.is_relative_to(skill.info.skill_dir)):
             content = self._bind(content, skill.skill_root, skill.info.skill_dir.name)
         else:

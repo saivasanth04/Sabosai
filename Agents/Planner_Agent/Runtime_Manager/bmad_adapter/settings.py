@@ -72,6 +72,14 @@ class PermissionSettings:
 
 
 @dataclass
+class FilesystemSettings:
+    backend: str = "auto"                      # auto | mcp | local  (agent file tools → GoModel filesystem MCP)
+    mcp_server: str = "filesystem"             # GoModel server slug in config.yaml
+    expose_raw_mcp_tools: bool = False         # hide filesystem_* from agents (they bypass permissions/tracking)
+    fallback_to_local: bool = True             # auto mode: tool not whitelisted / path outside roots → local
+
+
+@dataclass
 class LoaderSettings:
     max_resource_files: int = 400
     max_file_bytes: int = 512_000
@@ -103,6 +111,7 @@ class AdapterSettings:
     execution: ExecutionSettings = field(default_factory=ExecutionSettings)
     permissions: PermissionSettings = field(default_factory=PermissionSettings)
     loader: LoaderSettings = field(default_factory=LoaderSettings)
+    filesystem: FilesystemSettings = field(default_factory=FilesystemSettings)
     install: BMadInstallDefaults = field(default_factory=BMadInstallDefaults)
 
     # ------------------------------------------------------------------ loading

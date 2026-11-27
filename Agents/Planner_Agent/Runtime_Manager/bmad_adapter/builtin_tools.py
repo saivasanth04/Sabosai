@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .errors import BMadLoaderError, ToolError
+from .loader import TEXT_SUFFIXES
 from .skill_executor import ISOLATE_WHEN_NESTED
 from .tool_manager import Tool, ToolContext
 
@@ -26,109 +27,176 @@ def register_builtin_tools(rt: "BMadRuntime") -> None:
     tm = rt.tools
 
     # ------------------------------------------------------------ filesystem
+    # All agent file I/O goes through rt.fs → GoModel filesystem MCP (or local fallback). The adapter keeps
+    # its own guarantees around it: permission checks, BMAD token binding, step tracking, artifact tracking.
+    fs = rt.fs
+
+    def _skill_id(ctx: ToolContext) -> str | None:
+        return (ctx.session.active_skill or {}).get("skill_id")
+
+    def _record(ctx: ToolContext, p: Path, action: str):
+        art = rt.artifacts.record(p, action=action, session_id=ctx.session.session_id, skill_id=_skill_id(ctx))
+        _track(ctx, p)
+        return art
+
     def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
         path = args.get("path") or ""
+        head, tail = args.get("head"), args.get("tail")
+        if args.get("max_lines") and head is None:
+            head = int(args.get("offset") or 0) + int(args["max_lines"])
+        via = {"backend": "local"}
+
+        def reader(p: Path) -> str:
+            text, via["backend"] = fs.run("read", "read", p, head=head, tail=tail)
+            return text
         try:
-            res = rt.loader.read_resource(path, ctx.skill)
+            res = rt.loader.read_resource(path, ctx.skill, reader=reader)
             p, content = res.path, res.content
         except BMadLoaderError:
             p = rt.permissions.check_read(path)
             if not p.is_file():
                 raise ToolError(f"file not found: {p}")
-            content = p.read_text(encoding="utf-8", errors="replace").replace("{project-root}", str(rt.project_root))
+            content = reader(p).replace("{project-root}", str(rt.project_root))
         else:
             rt.permissions.check_read(p)
+        if args.get("offset"):
+            content = "\n".join(content.splitlines()[int(args["offset"]):])
         warning = rt.workflow.on_file_read(ctx.session, p)
-        start, limit = int(args.get("offset") or 0), args.get("max_lines")
-        if start or limit:
-            lines = content.splitlines()
-            content = "\n".join(lines[start: start + int(limit) if limit else None])
-        header = f"# {p}\n"
-        return header + content + (f"\n\n{warning}" if warning else "")
+        return f"# {p}  [{via['backend']}]\n" + content + (f"\n\n{warning}" if warning else "")
+
+    def read_multiple_files(args: dict[str, Any], ctx: ToolContext) -> str:
+        paths = [rt.permissions.check_read(x) for x in (args.get("paths") or [])][:20]
+        if not paths:
+            raise ToolError("paths must be a non-empty list")
+        if fs.backend_for("read_many", *paths) is fs.mcp and fs.mcp is not None and fs.mcp.has("read_many"):
+            fs.stats.mcp_calls += 1
+            text = fs.mcp.read_many(paths)
+        else:
+            text = "\n---\n".join(f"{p}:\n{fs.run('read', 'read', p)[0]}" for p in paths)
+        for p in paths:
+            rt.workflow.on_file_read(ctx.session, p)
+        return text.replace("{project-root}", str(rt.project_root))
 
     def list_dir(args: dict[str, Any], ctx: ToolContext) -> str:
         p = rt.permissions.check_read(args.get("path") or str(rt.project_root))
-        if not p.is_dir():
-            raise ToolError(f"not a directory: {p}")
-        recursive = bool(args.get("recursive"))
-        pattern = args.get("pattern") or "*"
-        it = p.rglob(pattern) if recursive else p.glob(pattern)
+        if args.get("recursive"):
+            return directory_tree({"path": str(p), "depth": args.get("depth", 4)}, ctx)
+        entries, via = fs.run("list", "list", p)
+        pattern = args.get("pattern")
         rows = []
-        for i, child in enumerate(sorted(it)):
-            if i >= 500:
-                rows.append("…(truncated at 500 entries)")
-                break
-            if any(part in {".git", "node_modules", "__pycache__"} for part in child.parts):
+        for e in entries:
+            if e.name in {".git", "node_modules", "__pycache__"} or (pattern and not fnmatch.fnmatch(e.name, pattern)):
                 continue
-            kind = "dir " if child.is_dir() else f"{child.stat().st_size:>8} B"
-            rows.append(f"{kind}  {child.relative_to(p).as_posix()}")
-        return f"# {p}\n" + ("\n".join(rows) or "(empty)")
+            rows.append(("dir " if e.is_dir else f"{e.size if e.size is not None else '?':>8} B") + f"  {e.name}")
+        return f"# {p}  [{via}]\n" + ("\n".join(rows) or "(empty)")
+
+    def directory_tree(args: dict[str, Any], ctx: ToolContext) -> str:
+        p = rt.permissions.check_read(args.get("path") or str(rt.project_root))
+        exclude = list(args.get("exclude") or []) + ["node_modules", ".git", "__pycache__", "render"]
+        depth = args.get("depth", 4)
+        tree, via = fs.run("tree", "tree", p, depth=int(depth) if depth else None, exclude=exclude)
+        lines: list[str] = []
+
+        def walk(nodes, indent):
+            for n in nodes:
+                lines.append("  " * indent + (n["name"] + "/" if n.get("type") == "directory" else n["name"]))
+                if len(lines) > 600:
+                    return
+                walk(n.get("children") or [], indent + 1)
+        walk(tree, 0)
+        return f"# {p}  [{via}]\n" + "\n".join(lines[:600])
+
+    def file_info(args: dict[str, Any], ctx: ToolContext) -> str:
+        p = rt.permissions.check_read(args["path"])
+        text, via = fs.run("info", "info", p)
+        return f"# {p}  [{via}]\n{text}"
 
     def search_files(args: dict[str, Any], ctx: ToolContext) -> str:
         root = rt.permissions.check_read(args.get("root") or str(rt.project_root))
-        glob_pat = args.get("glob") or "*"
+        glob_pat = args.get("glob") or "**/*"
+        exclude = list(args.get("exclude") or []) + ["node_modules", ".git", "__pycache__"]
+        paths, via = fs.run("search", "search", root, pattern=glob_pat, exclude=exclude)
         needle = (args.get("contains") or "").lower()
-        hits = []
-        for p in root.rglob(glob_pat):
-            if not p.is_file() or any(x in p.parts for x in (".git", "node_modules", "__pycache__")):
+        if not needle:
+            return f"[{via}]\n" + ("\n".join(paths[:300]) or "no matches")
+        hits = []                                # content search: read candidate files through the backend
+        for path in paths[:400]:
+            p = Path(path)
+            if p.suffix.lower() not in TEXT_SUFFIXES:
                 continue
-            if needle:
-                try:
-                    text = p.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-                idx = text.lower().find(needle)
-                if idx == -1:
-                    continue
+            try:
+                text = fs.run("read", "read", p)[0]
+            except Exception:  # noqa: BLE001
+                continue
+            idx = text.lower().find(needle)
+            if idx != -1:
                 line_no = text.count("\n", 0, idx) + 1
                 hits.append(f"{p}:{line_no}: {text[max(0, idx - 60): idx + 100].replace(chr(10), ' ')}")
-            else:
-                hits.append(str(p))
             if len(hits) >= 200:
                 break
-        return "\n".join(hits) or "no matches"
+        return f"[{via}]\n" + ("\n".join(hits) or "no matches")
 
     def write_file(args: dict[str, Any], ctx: ToolContext) -> str:
         p = rt.permissions.check_write(args["path"])
         if args.get("mode") == "create" and p.exists():
-            raise ToolError(f"{p} already exists (mode=create)")
-        p.parent.mkdir(parents=True, exist_ok=True)
+            raise ToolError(f"{p} already exists (mode=create) — use edit_file or mode=overwrite")
         content = args.get("content", "")
-        tmp = p.with_name(f".{p.name}.tmp")
-        tmp.write_text(content, encoding="utf-8")
-        os.replace(tmp, p)
-        art = rt.artifacts.record(p, action="write", session_id=ctx.session.session_id,
-                                  skill_id=(ctx.session.active_skill or {}).get("skill_id"))
-        _track(ctx, p)
-        return f"wrote {p} ({len(content)} chars)" + (f" [artifact: {art.kind}, status={art.status}]" if art else "")
+        _, via = fs.run("write", "write", p, content=content)
+        art = _record(ctx, p, "write")
+        return (f"wrote {p} ({len(content)} chars) [{via}]"
+                + (f" [artifact: {art.kind}, status={art.status}]" if art else ""))
 
     def append_file(args: dict[str, Any], ctx: ToolContext) -> str:
         p = rt.permissions.check_write(args["path"])
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as fh:
-            fh.write(args.get("content", ""))
-        rt.artifacts.record(p, action="append", session_id=ctx.session.session_id,
-                            skill_id=(ctx.session.active_skill or {}).get("skill_id"))
-        _track(ctx, p)
-        return f"appended {len(args.get('content', ''))} chars to {p}"
+        content = args.get("content", "")
+        _, via = fs.run("append", "append", p, content=content)
+        _record(ctx, p, "append")
+        return f"appended {len(content)} chars to {p} [{via}]"
 
     def edit_file(args: dict[str, Any], ctx: ToolContext) -> str:
         p = rt.permissions.check_write(args["path"])
         if not p.is_file():
             raise ToolError(f"file not found: {p}")
-        text = p.read_text(encoding="utf-8")
-        old, new = args.get("old_text", ""), args.get("new_text", "")
-        count = text.count(old) if old else 0
-        if count == 0:
-            raise ToolError("old_text not found — re-read the file and copy the exact text")
-        if count > 1 and not args.get("replace_all"):
-            raise ToolError(f"old_text occurs {count} times; add context or set replace_all=true")
-        text = text.replace(old, new) if args.get("replace_all") else text.replace(old, new, 1)
-        p.write_text(text, encoding="utf-8")
-        rt.artifacts.record(p, action="edit", session_id=ctx.session.session_id,
-                            skill_id=(ctx.session.active_skill or {}).get("skill_id"))
-        _track(ctx, p)
-        return f"edited {p} ({count if args.get('replace_all') else 1} replacement(s))"
+        edits = args.get("edits")
+        if not edits:
+            old, new = args.get("old_text", ""), args.get("new_text", "")
+            if not old:
+                raise ToolError("give `edits` [{oldText,newText}] or `old_text` + `new_text`")
+            if args.get("replace_all"):            # MCP edit replaces first match only → full rewrite
+                text = fs.run("read", "read", p)[0]
+                if old not in text:
+                    raise ToolError("old_text not found — re-read the file and copy the exact text")
+                count = text.count(old)
+                _, via = fs.run("write", "write", p, content=text.replace(old, new))
+                _record(ctx, p, "edit")
+                return f"edited {p}: {count} replacement(s) [{via}]"
+            edits = [{"oldText": old, "newText": new}]
+        edits = [{"oldText": e.get("oldText", e.get("old_text", "")), "newText": e.get("newText", e.get("new_text", ""))}
+                 for e in edits]
+        diff, via = fs.run("edit", "edit", p, edits=edits, dry_run=bool(args.get("dry_run")))
+        if not args.get("dry_run"):
+            _record(ctx, p, "edit")
+        return f"edited {p} [{via}]\n{diff[:4000]}"
+
+    def create_directory(args: dict[str, Any], ctx: ToolContext) -> str:
+        p = rt.permissions.check_write(args["path"])
+        _, via = fs.run("mkdir", "mkdir", p)
+        return f"created {p} [{via}]"
+
+    def move_file(args: dict[str, Any], ctx: ToolContext) -> str:
+        src = rt.permissions.check_write(args["source"])
+        dst = rt.permissions.check_write(args["destination"])
+        _, via = fs.run("move", "move", src, dst)
+        if dst.is_file():
+            _record(ctx, dst, "move")
+        return f"moved {src} → {dst} [{via}]"
+
+    def copy_file(args: dict[str, Any], ctx: ToolContext) -> str:
+        src = rt.permissions.check_read(args["source"])
+        dst = rt.permissions.check_write(args["destination"])
+        _, via = fs.run("copy", "copy", src, dst)
+        _record(ctx, dst, "copy")
+        return f"copied {src} → {dst} [{via}]"
 
     # ---------------------------------------------------------------- scripts
     def run_script(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -239,22 +307,41 @@ def register_builtin_tools(rt: "BMadRuntime") -> None:
                      "profile": {"type": "string", "enum": ["readonly", "research", "write", "verify"]}, "output_file": S},
                     ["brief"])
     for tool in [
-        Tool("read_file", "Read a file (step files, references, templates, project docs). Relative paths resolve "
-             "from the active skill root. Read one step file at a time.",
-             _obj({"path": S, "offset": {"type": "integer"}, "max_lines": {"type": "integer"}}, ["path"]),
-             read_file, group="read"),
-        Tool("list_dir", "List a directory (optionally recursive / glob pattern).",
-             _obj({"path": S, "recursive": {"type": "boolean"}, "pattern": S}), list_dir, group="read"),
-        Tool("search_files", "Find files by glob and/or containing text under a root.",
-             _obj({"root": S, "glob": S, "contains": S}), search_files, group="read"),
-        Tool("write_file", "Create or overwrite a text file inside the project (documents, frontmatter updates).",
+        Tool("read_file", "Read a text file (step files, references, templates, project docs). Relative paths resolve "
+             "from the active skill root. Optional head/tail = first/last N lines. Read one step file at a time.",
+             _obj({"path": S, "head": {"type": "integer"}, "tail": {"type": "integer"},
+                   "offset": {"type": "integer"}, "max_lines": {"type": "integer"}}, ["path"]), read_file, group="read"),
+        Tool("read_multiple_files", "Read several text files at once (e.g. all planning artifacts for context).",
+             _obj({"paths": {"type": "array", "items": S}}, ["paths"]), read_multiple_files, group="read"),
+        Tool("list_dir", "List a directory ([dir] / size + name). recursive=true shows a tree.",
+             _obj({"path": S, "recursive": {"type": "boolean"}, "pattern": S, "depth": {"type": "integer"}}),
+             list_dir, group="read"),
+        Tool("directory_tree", "Recursive tree of a directory (node_modules/.git excluded). depth limits levels.",
+             _obj({"path": S, "depth": {"type": "integer"}, "exclude": {"type": "array", "items": S}}),
+             directory_tree, group="read"),
+        Tool("file_info", "Size, timestamps and type of a file or directory.", _obj({"path": S}, ["path"]),
+             file_info, group="read"),
+        Tool("search_files", "Find files by glob under a root ('**/*.jsx', '*.md'); add `contains` to also search "
+             "inside them for text.", _obj({"root": S, "glob": S, "contains": S,
+                                             "exclude": {"type": "array", "items": S}}), search_files, group="read"),
+        Tool("write_file", "Create or overwrite a text file inside the project (parent folders are created).",
              _obj({"path": S, "content": S, "mode": {"type": "string", "enum": ["overwrite", "create"]}},
                   ["path", "content"]), write_file, group="write"),
-        Tool("append_file", "Append text to a file inside the project (append-only document building).",
+        Tool("append_file", "Append text to a file inside the project (created if missing; no newline added).",
              _obj({"path": S, "content": S}, ["path", "content"]), append_file, group="write"),
-        Tool("edit_file", "Replace exact text in a project file (e.g. update stepsCompleted / status frontmatter).",
-             _obj({"path": S, "old_text": S, "new_text": S, "replace_all": {"type": "boolean"}},
-                  ["path", "old_text", "new_text"]), edit_file, group="write"),
+        Tool("edit_file", "Edit a project file: `edits` = [{oldText, newText}, …] applied in order (each replaces the "
+             "first match; line endings/indentation tolerant), or `old_text` + `new_text` (+ replace_all). "
+             "Returns a diff. dry_run=true previews.",
+             _obj({"path": S, "edits": {"type": "array", "items": _obj({"oldText": S, "newText": S},
+                                                                       ["oldText", "newText"])},
+                   "old_text": S, "new_text": S, "replace_all": {"type": "boolean"}, "dry_run": {"type": "boolean"}},
+                  ["path"]), edit_file, group="write"),
+        Tool("create_directory", "Create a directory (and parents) inside the project.", _obj({"path": S}, ["path"]),
+             create_directory, group="write"),
+        Tool("move_file", "Move or rename a file/directory inside the project (fails if destination exists).",
+             _obj({"source": S, "destination": S}, ["source", "destination"]), move_file, group="write"),
+        Tool("copy_file", "Copy a file to a new path inside the project (never overwrites).",
+             _obj({"source": S, "destination": S}, ["source", "destination"]), copy_file, group="write"),
         Tool("run_script", "Run a BMAD Python script. Pass the skill's command verbatim in `command` "
              "(e.g. `uv run /abs/_bmad/scripts/memlog.py append --workspace … --type decision --text \"…\"`) "
              "or `script` + `args`.",

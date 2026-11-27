@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -577,3 +578,190 @@ def test_build_expands_per_story_and_verifies(settings_for, project):
     assert all(s.status == "completed" and s.verification["ok"] for s in h.plan.steps)
     checks = {c["check"].split(" ")[0] for c in h.plan.steps[-1].verification["checks"]}
     assert {"install", "start-up"} <= checks
+
+
+# ------------------------------------------------- GoModel filesystem MCP backend
+def _fs_mcp(srv, roots, allowed):
+    """Turn the fake gateway into GoModel + @modelcontextprotocol/server-filesystem (namespaced filesystem_*)."""
+    import difflib
+    roots = [str(Path(r).resolve()) for r in roots]
+
+    def ok(p):
+        rp = str(Path(p).resolve())
+        if not any(rp == r or rp.startswith(r + os.sep) for r in roots):
+            raise PermissionError(f"Access denied - path outside allowed directories: {p}")
+        return Path(rp)
+
+    def tool(name, a):
+        if name == "list_allowed_directories":
+            return "Allowed directories:\n" + "\n".join(roots)
+        if name == "read_text_file":
+            lines = ok(a["path"]).read_text().splitlines()
+            if "head" in a:
+                lines = lines[:a["head"]]
+            if "tail" in a:
+                lines = lines[-a["tail"]:]
+            return "\n".join(lines)
+        if name == "read_multiple_files":
+            return "\n---\n".join(f"{p}:\n{ok(p).read_text()}\n" for p in a["paths"])
+        if name == "list_directory_with_sizes":
+            d = ok(a["path"])
+            return "\n".join(f"[DIR] {c.name}" if c.is_dir() else f"[FILE] {c.name:<30} {c.stat().st_size:>8} B"
+                             for c in sorted(d.iterdir())) + "\n\nTotal: x"
+        if name == "directory_tree":
+            def walk(d):
+                return [{"name": c.name, "type": "directory", "children": walk(c)} if c.is_dir()
+                        else {"name": c.name, "type": "file"} for c in sorted(d.iterdir())
+                        if c.name not in (a.get("excludePatterns") or [])]
+            return json.dumps(walk(ok(a["path"])))
+        if name == "search_files":
+            d = ok(a["path"])
+            hits = [str(c) for c in d.glob(a["pattern"])
+                    if not any(x in c.parts for x in (a.get("excludePatterns") or []))]
+            return "\n".join(hits) or "No matches found"
+        if name == "get_file_info":
+            return f"size: {ok(a['path']).stat().st_size}\nisFile: true"
+        if name == "write_file":
+            p = ok(a["path"])
+            if not p.parent.is_dir():
+                raise FileNotFoundError(f"ENOENT: parent directory does not exist: {p.parent}")
+            p.write_text(a["content"])
+            return f"Successfully wrote to {a['path']}"
+        if name == "append_file":
+            with ok(a["path"]).open("a") as fh:
+                fh.write(a["content"])
+            return f"Successfully appended to {a['path']}"
+        if name == "edit_file":
+            p = ok(a["path"])
+            old = text = p.read_text()
+            for e in a["edits"]:
+                if e["oldText"] not in text:
+                    raise ValueError(f"Could not find exact match for edit:\n{e['oldText']}")
+                text = text.replace(e["oldText"], e["newText"], 1)
+            if not a.get("dryRun"):
+                p.write_text(text)
+            return "```diff\n" + "".join(difflib.unified_diff(old.splitlines(True), text.splitlines(True))) + "```"
+        if name == "create_directory":
+            ok(a["path"]).mkdir(parents=True, exist_ok=True)
+            return f"Successfully created directory {a['path']}"
+        if name == "move_file":
+            ok(a["source"]).rename(ok(a["destination"]))
+            return "Successfully moved"
+        if name == "copy_file":
+            import shutil
+            shutil.copy2(ok(a["source"]), ok(a["destination"]))
+            return "Successfully copied"
+        raise ValueError(name)
+
+    def mcp_reply(body):
+        m = body["method"]
+        if m == "initialize":
+            return {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}}
+        if m == "tools/list":
+            return {"tools": [{"name": f"filesystem_{t}", "description": t,
+                               "inputSchema": {"type": "object", "properties": {}}} for t in allowed]}
+        if m == "tools/call":
+            name = body["params"]["name"].removeprefix("filesystem_")
+            if name not in allowed:
+                return {"content": [{"type": "text", "text": f"tool {name} not allowed"}], "isError": True}
+            try:
+                return {"content": [{"type": "text", "text": tool(name, body["params"]["arguments"])}]}
+            except Exception as exc:  # noqa: BLE001
+                return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+        return {}
+    srv.mcp_reply = mcp_reply
+    srv.sse = False
+
+
+FS_ALL = ["list_allowed_directories", "read_text_file", "read_multiple_files", "list_directory",
+          "list_directory_with_sizes", "directory_tree", "search_files", "get_file_info", "write_file",
+          "append_file", "edit_file", "create_directory", "move_file", "copy_file"]
+FS_READONLY = ["list_allowed_directories", "list_directory", "directory_tree", "search_files", "get_file_info",
+               "read_text_file", "read_multiple_files"]       # = the current config.yaml whitelist
+
+
+def _fs_calls(srv):
+    return [q["body"]["params"]["name"] for q in srv.requests
+            if q["path"] == "/mcp" and q["body"].get("method") == "tools/call"]
+
+
+def test_file_tools_route_through_gomodel_filesystem(settings_for, project, fake_gomodel):
+    _fs_mcp(fake_gomodel, [project, BMAD_ROOT], FS_ALL)
+    seen = {}
+
+    def first(m, names):
+        seen["names"] = names
+        return tools(call("write_file", path="docs/notes/plan.md", content="---\nstatus: draft\n---\n# Plan\nA\n"),
+                     call("append_file", path="docs/notes/plan.md", content="B\n"),
+                     call("edit_file", path="docs/notes/plan.md", edits=[{"oldText": "status: draft",
+                                                                         "newText": "status: final"}]),
+                     call("read_file", path="docs/notes/plan.md", head=3),
+                     call("list_dir", path="docs/notes"),
+                     call("search_files", glob="**/*.md", contains="Plan"),
+                     call("copy_file", source="docs/notes/plan.md", destination="docs/copy.md"),
+                     call("read_file", path="references/headless.md"))          # BMAD skill file, via MCP too
+    llm = ScriptedLLM(sequence(first, lambda m, n: say("done")))
+    s = settings_for(gomodel={"mcp_enabled": True, "base_url": fake_gomodel.base_url})
+    rt = BMadRuntime(s, llm=llm, mcp_client=GoModelMCPClient(s.gomodel))
+    assert not any(n.startswith("filesystem_") for n in rt.tools.mcp_tool_names())   # raw tools hidden
+    rt.start(skill="bmad-prd", message="go")
+    assert not any(n.startswith("filesystem_") for n in seen["names"])
+    assert {"create_directory", "move_file", "copy_file", "directory_tree", "file_info"} <= set(seen["names"])
+    results = [m["content"] for m in llm.calls[-1]["messages"] if m["role"] == "tool"]
+    assert all("[mcp]" in r for r in results[:7]), results[:7]
+    assert "status: final" in results[3] and "B" not in results[3]               # head=3 honoured by the server
+    assert "# Headless Mode" in results[7] and "{project-root}" not in results[7]   # token binding kept
+    calls = _fs_calls(fake_gomodel)
+    for t in ("write_file", "append_file", "edit_file", "read_text_file", "list_directory_with_sizes",
+              "search_files", "copy_file", "create_directory"):
+        assert f"filesystem_{t}" in calls, t
+    assert (project / "docs/notes/plan.md").read_text().count("status: final") == 1
+    art = rt.artifacts.as_dicts()
+    assert any(a["path"] == "docs/notes/plan.md" and a["status"] == "final" for a in art)   # tracking kept
+    h = rt.health()["filesystem"]
+    assert h["writes_via"] == "mcp" and h["calls"]["local"] == 0
+
+
+def test_readonly_whitelist_falls_back_for_writes(settings_for, project, fake_gomodel):
+    _fs_mcp(fake_gomodel, [project, BMAD_ROOT], FS_READONLY)
+    llm = ScriptedLLM(sequence(tools(call("write_file", path="a.md", content="x"), call("read_file", path=str(project / "a.md"))),
+                               say("ok")))
+    s = settings_for(gomodel={"mcp_enabled": True, "base_url": fake_gomodel.base_url})
+    rt = BMadRuntime(s, llm=llm, mcp_client=GoModelMCPClient(s.gomodel))
+    rt.start(message="x")
+    res = [m["content"] for m in llm.calls[-1]["messages"] if m["role"] == "tool"]
+    assert "[local]" in res[0] and "[mcp]" in res[1]
+    h = rt.health()["filesystem"]
+    assert h["writes_via"].startswith("local") and any("allowed_tools" in f for f in h["fallbacks"])
+    assert "filesystem_write_file" not in _fs_calls(fake_gomodel)
+
+
+def test_strict_mcp_backend_and_permissions(settings_for, project, fake_gomodel):
+    _fs_mcp(fake_gomodel, [project, BMAD_ROOT], FS_READONLY)
+    llm = ScriptedLLM(sequence(tools(call("write_file", path="a.md", content="x"),
+                                     call("write_file", path=str(Path(BMAD_ROOT) / "evil.md"), content="x"),
+                                     call("edit_file", path=str(Path(BMAD_ROOT) / "README.md"), old_text="BMad",
+                                          new_text="X")),
+                               say("ok")))
+    s = settings_for(gomodel={"mcp_enabled": True, "base_url": fake_gomodel.base_url},
+                     filesystem={"backend": "mcp"})
+    rt = BMadRuntime(s, llm=llm, mcp_client=GoModelMCPClient(s.gomodel))
+    rt.start(message="x")
+    res = [m["content"] for m in llm.calls[-1]["messages"] if m["role"] == "tool"]
+    assert "backend is 'mcp'" in res[0] and "allowed_tools" in res[0]
+    assert "PERMISSION DENIED" in res[1] and "PERMISSION DENIED" in res[2]       # blocked before reaching MCP
+    assert not (project / "a.md").exists()
+
+
+def test_mcp_error_surfaces_and_outside_roots_falls_back(settings_for, project, fake_gomodel, tmp_path):
+    _fs_mcp(fake_gomodel, [project], FS_ALL)                     # BMAD clone NOT in MCP roots
+    (project / "n.md").write_text("hello\n")
+    llm = ScriptedLLM(sequence(tools(call("edit_file", path="n.md", edits=[{"oldText": "nope", "newText": "x"}]),
+                                     call("read_file", path="references/headless.md")), say("ok")))
+    s = settings_for(gomodel={"mcp_enabled": True, "base_url": fake_gomodel.base_url})
+    rt = BMadRuntime(s, llm=llm, mcp_client=GoModelMCPClient(s.gomodel))
+    rt.start(skill="bmad-prd", message="x")
+    res = [m["content"] for m in llm.calls[-1]["messages"] if m["role"] == "tool"]
+    assert res[0].startswith("ERROR: filesystem_edit_file: Could not find exact match")
+    assert "[local]" in res[1] and "# Headless Mode" in res[1]
+    assert any("outside" in f for f in rt.fs.describe()["fallbacks"])

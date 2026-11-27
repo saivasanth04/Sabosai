@@ -25,6 +25,7 @@ Planner Agent ──► BMadRuntime ──► GoModel /v1/chat/completions   (LL
 | Configuration resolver | `config_resolver.py` | Replaces the npm installer. Lays down `{project}/_bmad/scripts`, `config.toml`, `config.user.toml`, `_config/bmad-help.csv` and `custom/`. Resolves config by running BMAD's own `resolve_config.py` / `resolve_customization.py`, with an in-process `config_utils` fallback. Never overwrites a real installer's files or your `_bmad/custom` overrides. |
 | Script executor | `script_executor.py` | Runs BMAD's Python scripts (`memlog.py`, `sprint_plan.py`, `brain.py`, …) from the exact command line the skill prints, using `uv run` when available and the current Python otherwise. No `shell=True`. Uses a Windows-safe tokenizer and UTF-8 output. |
 | Command executor | `command_executor.py` | A scoped developer shell for the `run_command` tool: npm, node, git, pytest, tsc and similar, one command per call, run inside the project. Refuses chaining (`&&`, pipes, redirects), `git push`, `npm publish` and global installs. Dev servers only run as tracked background processes. Also provides the start-up smoke check. |
+| Filesystem backend | `fs_backend.py` | Does the file I/O for the agents' file tools through GoModel's `filesystem` MCP server (`@modelcontextprotocol/server-filesystem` 2.4.0). Modes: `auto`, `mcp`, `local`. See *Filesystem through GoModel* below. |
 | Tool manager | `tool_manager.py`, `builtin_tools.py`, `mcp_client.py` | One registry for the built-in tools and the GoModel MCP tools. Built-ins: `read_file`, `write_file`, `edit_file`, `run_script`, `invoke_skill`, `spawn_subagent(s)`, `ask_user`, `complete_workflow`, `activate_agent`. MCP tools are discovered over streamable HTTP (session id, SSE, pagination) and namespaced the way GoModel does it (`duckduckgo_search`). |
 | Subagent manager | `subagent_manager.py` | Isolated subagents with fresh context and tool profiles: `readonly`, `research` (adds MCP), `write` (for reviewers writing `review-*.md`). Optional persona or skill as the subagent's program. Runs them in parallel on a thread pool with a depth limit, and saves transcripts to `_bmad/runtime/subagents/`. |
 | Context manager | `context_manager.py` | Keeps context within budget. First it clips stale tool output, then it has the LLM summarise older turns into session memory (decisions, answers, paths, current step), and as a last resort it trims. It never splits a tool-call/result pair. |
@@ -76,6 +77,27 @@ Each step runs as its owning agent in a fresh session, and gets the earlier step
 - **Verified builds.** After each story, the orchestrator itself runs `npm install`, build, tests and a server start-up check for every package. Failures go back to the dev agent with the real error output, up to 2 fix rounds.
 
 Run the same checks any time with `python -m bmad_adapter --project <path> verify`.
+
+## Filesystem through GoModel
+
+Agents use the adapter's file tools. Each one keeps the adapter-side safety: permission checks, `{project-root}`/`{skill-root}` substitution in BMAD files, step tracking, and artifact tracking. The disk I/O itself is done by GoModel's filesystem server:
+
+| Adapter tool | GoModel tool(s) |
+|---|---|
+| `read_file` (head/tail) | `filesystem_read_text_file` |
+| `read_multiple_files` | `filesystem_read_multiple_files` |
+| `list_dir` | `filesystem_list_directory_with_sizes` (or `list_directory`) |
+| `directory_tree` | `filesystem_directory_tree` |
+| `search_files` | `filesystem_search_files` (glob); `contains` then reads matches via `read_text_file` |
+| `file_info` | `filesystem_get_file_info` |
+| `write_file` / `append_file` | `filesystem_create_directory` + `filesystem_write_file` / `filesystem_append_file` |
+| `edit_file` | `filesystem_edit_file` (multi-edit, returns a diff); `replace_all` uses read + write |
+| `create_directory` / `move_file` / `copy_file` | `filesystem_create_directory` / `move_file` / `copy_file` |
+
+- **Hidden raw tools.** The raw `filesystem_*` tools aren't shown to agents (`expose_raw_mcp_tools = false`), so nothing can bypass the permission and tracking layer.
+- **Server-side protection.** `config.yaml` starts the server with `--read-only-dir C:\Projects\NTG\Agents\Planner_Agent\Plugins`. The server itself then refuses writes into the BMAD clone, on top of the adapter's own refusal.
+- **Fallbacks.** In `auto` mode, a write tool that isn't whitelisted, or a path outside the server's folder, falls back to local I/O and is listed under `health` → `filesystem.fallbacks`.
+- **Internal files stay local.** Sessions, the artifact index, BMAD config bootstrap and registry scans are runtime infrastructure, so they keep using local I/O.
 
 ## Quick start (Windows)
 
@@ -133,7 +155,7 @@ place.
 python -m pytest tests -q
 ```
 
-There are 30 end-to-end tests, run against the real v6.12.4 skill files with a scripted LLM and a fake
+There are 34 end-to-end tests, run against the real v6.12.4 skill files with a scripted LLM and a fake
 GoModel chat and MCP server. They cover: install and config resolution through BMAD's own scripts,
 custom override layers, the full interactive John → PRD → memlog → back-to-menu flow, headless status
 JSON, nudges, the planner answer provider, parallel reviewer subagents, read-only research subagents,

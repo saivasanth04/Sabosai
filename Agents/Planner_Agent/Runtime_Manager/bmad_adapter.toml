@@ -25,6 +25,14 @@ mcp_path = "/mcp"                       # "/mcp/<virtual-server>" to hand BMAD a
 mcp_servers = []                        # [] = all servers in GoModel config.yaml; or e.g. ["duckduckgo", "crawl4ai", "context7"]
 # mcp_tool_discovery = "search"         # if your catalog grows large: only search_tools + call_tool are listed
 
+[filesystem]                            # agent file tools → GoModel filesystem MCP (@modelcontextprotocol/server-filesystem)
+backend = "auto"                        # auto: MCP when the tool is whitelisted + path inside its roots, else local
+                                        # mcp: MCP only (errors instead of falling back) | local: never use MCP
+mcp_server = "filesystem"               # server slug in C:\Projects\NTG\config.yaml
+expose_raw_mcp_tools = false            # keep filesystem_* hidden: agents use the adapter tools, which add
+                                        # permission checks, artifact/step tracking and BMAD path binding
+fallback_to_local = true
+
 [execution]
 max_turns_per_message = 60              # model calls per send() before yielding (resume() continues)
 max_tool_calls_per_turn = 16

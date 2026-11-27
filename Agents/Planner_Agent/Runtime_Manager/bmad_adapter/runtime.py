@@ -37,6 +37,7 @@ from .command_executor import CommandExecutor
 from .config_resolver import ConfigResolver
 from .context_manager import ContextManager
 from .errors import BMadAdapterError
+from .fs_backend import FsRouter, McpFs
 from .instruction_engine import InstructionEngine
 from .llm_client import ChatClient, GoModelChatClient
 from .loader import BMadLoader
@@ -104,6 +105,10 @@ class BMadRuntime:
         # tools + model
         mcp = mcp_client if mcp_client is not None else (GoModelMCPClient(s.gomodel) if s.gomodel.mcp_enabled else None)
         self.tools = ToolManager(self.permissions, mcp, s.execution.tool_result_max_chars)
+        fs_prefix = f"{s.filesystem.mcp_server}_"
+        self.fs = FsRouter(s.filesystem.backend, None, s.filesystem.fallback_to_local)   # MCP side attached below
+        if s.filesystem.backend != "local" and not s.filesystem.expose_raw_mcp_tools:
+            self.tools.hidden_prefixes.append(fs_prefix)
         self.llm: ChatClient = llm or GoModelChatClient(s.gomodel)
 
         # execution
@@ -125,6 +130,12 @@ class BMadRuntime:
                                                                "implementation_artifacts", "project_knowledge") if k in v)
         if connect_mcp and mcp is not None:
             self.tools.connect_mcp()
+        exposed = self.tools.upstream_names(fs_prefix)
+        mcp_fs = None
+        if mcp is not None and exposed and s.filesystem.backend != "local":
+            mcp_fs = McpFs(mcp, s.filesystem.mcp_server, exposed)
+            mcp_fs.load_roots()
+        self.fs.mcp = mcp_fs
         self._orchestrator: Orchestrator | None = None
 
     @property
@@ -259,7 +270,7 @@ class BMadRuntime:
     def health(self) -> dict[str, Any]:
         return {"bmad_root": str(self.bmad_root), "project_root": str(self.project_root),
                 "registry": self.registry.snapshot.summary(), "mcp": self.tools.mcp_status,
-                "mcp_tools": self.tools.mcp_tool_names(), "uv": self.scripts.uv or "not found (python fallback)",
+                "mcp_tools": self.tools.mcp_tool_names(), "filesystem": self.fs.describe(), "uv": self.scripts.uv or "not found (python fallback)",
                 "model": self.settings.gomodel.model, "gateway": self.settings.gomodel.base_url}
 
     # =================================================== planner integration

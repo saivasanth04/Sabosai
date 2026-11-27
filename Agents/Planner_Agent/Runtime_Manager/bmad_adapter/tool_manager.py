@@ -31,8 +31,9 @@ log = logging.getLogger(__name__)
 _NAME_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Tool groups, used to scope subagents and modes
-READ_ONLY_TOOLS = {"read_file", "list_dir", "search_files", "list_bmad_skills"}
-WRITE_TOOLS = {"write_file", "append_file", "edit_file"}
+READ_ONLY_TOOLS = {"read_file", "read_multiple_files", "list_dir", "directory_tree", "file_info", "search_files",
+                   "list_bmad_skills"}
+WRITE_TOOLS = {"write_file", "append_file", "edit_file", "create_directory", "move_file", "copy_file"}
 CONTROL_TOOLS = {"ask_user", "complete_workflow", "invoke_skill", "spawn_subagent", "spawn_subagents",
                  "activate_agent", "dismiss_agent"}
 
@@ -81,6 +82,8 @@ class ToolManager:
         self.result_max_chars = result_max_chars
         self._tools: dict[str, Tool] = {}
         self.mcp_status: str = "not connected"
+        self.mcp_upstream: dict[str, str] = {}          # registered name → upstream (gateway) tool name
+        self.hidden_prefixes: list[str] = []            # e.g. ["filesystem_"]: routed via the fs backend
         self.call_log: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------- registry
@@ -118,9 +121,12 @@ class ToolManager:
                 text, is_error = self.mcp.call_tool(_n, args)  # type: ignore[union-attr]
                 return ("ERROR from MCP tool: " if is_error else "") + text
 
+            hidden = any(upstream.startswith(pfx) for pfx in self.hidden_prefixes)
+            self.mcp_upstream[name] = upstream
             self.register(Tool(name=name, description=f"[GoModel MCP] {t.description}",
                                parameters=_clean_schema(t.input_schema), handler=handler, source="mcp",
-                               group="mcp-read" if read_only_hint else "mcp", external=True))
+                               group="mcp-hidden" if hidden else ("mcp-read" if read_only_hint else "mcp"),
+                               external=True))
             count += 1
         self.mcp_status = f"connected ({count} tools)"
         return count
@@ -135,6 +141,8 @@ class ToolManager:
             if ctx.allowed is not None and t.name not in ctx.allowed and not any(
                     fnmatch.fnmatch(t.name, p) for p in ctx.allowed if "*" in p):
                 continue
+            if t.group == "mcp-hidden":
+                continue
             if ctx.read_only and (t.group in {"write"} or t.name in WRITE_TOOLS):
                 continue
             if ctx.depth > 0 and t.name in {"ask_user", "activate_agent", "dismiss_agent"}:
@@ -143,7 +151,12 @@ class ToolManager:
         return sorted(out, key=lambda t: (t.source != "builtin", t.name))
 
     def mcp_tool_names(self) -> list[str]:
-        return sorted(n for n, t in self._tools.items() if t.source == "mcp")
+        """MCP tools agents can see (raw filesystem tools are routed through the fs backend instead)."""
+        return sorted(n for n, t in self._tools.items() if t.source == "mcp" and t.group != "mcp-hidden")
+
+    def upstream_names(self, prefix: str) -> set[str]:
+        """Upstream tool names exposed by one GoModel server, without the ``<slug>_`` prefix."""
+        return {u[len(prefix):] for u in self.mcp_upstream.values() if u.startswith(prefix)}
 
     # --------------------------------------------------------------- execute
     def execute(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> str:
